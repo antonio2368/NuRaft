@@ -25,21 +25,19 @@ limitations under the License.
 #include "error_code.hxx"
 #include "event_awaiter.hxx"
 #include "global_mgr.hxx"
-#include "handle_client_request.hxx"
 #include "handle_custom_notification.hxx"
 #include "internal_timer.hxx"
 #include "peer.hxx"
 #include "snapshot.hxx"
 #include "snapshot_sync_ctx.hxx"
-#include "stat_mgr.hxx"
 #include "state_machine.hxx"
 #include "state_mgr.hxx"
 #include "tracer.hxx"
 
-#include <cassert>
 #include <random>
 #include <sstream>
 #include <thread>
+#include <optional>
 
 namespace nuraft {
 
@@ -675,6 +673,30 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
     if ( req.get_type() == msg_type::leader_status_request ) {
         return handle_leader_status_req(req);
     }
+
+    struct ExecAutoResume {
+        explicit ExecAutoResume(std::function<void()> func) : clean_func_(func) {}
+        ~ExecAutoResume() { clean_func_(); }
+        std::function<void()> clean_func_;
+    };
+
+    auto exec_auto_resume = [&]() -> std::optional<ExecAutoResume>
+    {
+        if (req.get_type() != msg_type::install_snapshot_request)
+            return std::nullopt;
+
+        // let's pause committing in background so it doesn't access logs
+        // while they are being compacted
+        pause_state_machine_exeuction();
+
+        size_t wait_count = 0;
+        while (!wait_for_state_machine_pause(500)) {
+            p_in("waiting for state machine pause before applying snapshot: count %zu",
+                 ++wait_count);
+        }
+
+        return ExecAutoResume([this](){ resume_state_machine_execution(); });
+    }();
 
     recur_lock(lock_);
     if ( req.get_type() == msg_type::append_entries_request ||
